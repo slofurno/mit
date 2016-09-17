@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"labrpc"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -41,8 +42,8 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	Term  int
-	Entry string
+	Term    int
+	Command interface{}
 }
 
 //
@@ -53,6 +54,7 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd
 	persister *Persister
 	me        int // index into peers[]
+	applyCh   chan ApplyMsg
 
 	currentTerm int
 	votedFor    int
@@ -60,6 +62,7 @@ type Raft struct {
 
 	commitIndex int
 	lastApplied int
+	commands    []interface{}
 
 	nextIndex  []int
 	matchIndex []int
@@ -158,6 +161,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.VoteGranted = true
+	rf.timeout = 15 + rand.Intn(15)
 	rf.votedFor = args.CanidateId
 }
 
@@ -175,35 +179,86 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+func (rf *Raft) getTerm(index int) int {
+	if index < 0 {
+		return -1
+	}
+
+	return rf.log[index].Term
+}
+
+func min(a, b int) int {
+	if a > b {
+		return b
+	}
+	return a
+}
+
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
+
+	i := args.PrevLogIndex
+	index, _ := rf.lastLogIndexAndTerm()
+
+	rf.timeout = 15 + rand.Intn(15)
+	if args.LeaderCommit >= 0 {
+		//fmt.Println("leadercommit > 0 ", args)
+	}
+
+	if i > index || rf.getTerm(i) != args.PrevLogTerm {
+		reply.Success = false
+	} else {
+		reply.Success = true
+	}
 
 	//this was resetting votedfor....
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.isLeader = false
 		rf.votedFor = -1
+		fmt.Println("term out")
+		return
 	}
 
-	rf.timeout = 15 + rand.Intn(15)
+	fmt.Println("prevlogindex", i, index)
+
+	if len(args.Entries) > 0 {
+		fmt.Println("entries:", args.Entries)
+		rf.log = append(rf.log[:i+1], args.Entries...)
+	}
+
+	rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	return
 }
 
 func (rf *Raft) heartbeat() {
-	index, term := rf.lastLogIndexAndTerm()
-	args := AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: index,
-		PrevLogTerm:  term,
-		Entries:      []LogEntry{},
-		LeaderCommit: rf.commitIndex,
-	}
+	index, _ := rf.lastLogIndexAndTerm()
 
-	for i, p := range rf.peers {
+	for i, peer := range rf.peers {
+		i, peer := i, peer
 		if i != rf.me {
-			go func(peer *labrpc.ClientEnd, args AppendEntriesArgs) {
+			nextIndex := rf.nextIndex[i]
+			prevTerm := rf.getTerm(nextIndex - 1)
+			entries := []LogEntry{}
+
+			if nextIndex < len(rf.log) && nextIndex >= 0 {
+				entries = rf.log[nextIndex:]
+				fmt.Println("we about to sent these entries", nextIndex, entries)
+
+			}
+
+			fmt.Println("NEXTINDEX", nextIndex)
+			args := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: nextIndex - 1,
+				PrevLogTerm:  prevTerm,
+				Entries:      entries,
+				LeaderCommit: rf.commitIndex,
+			}
+			go func() {
 				reply := &AppendEntriesReply{}
 				peer.Call("Raft.AppendEntries", args, reply)
 				rf.mu.Lock()
@@ -212,8 +267,18 @@ func (rf *Raft) heartbeat() {
 					rf.currentTerm = reply.Term
 					rf.votedFor = -1
 					rf.isLeader = false
+					return
 				}
-			}(p, args)
+
+				if reply.Success {
+
+					fmt.Println("we sent these entries", nextIndex, entries)
+					rf.nextIndex[i] = index + 1
+					rf.matchIndex[i] = index
+				} else {
+					rf.nextIndex[i] = nextIndex - 1
+				}
+			}()
 		}
 	}
 }
@@ -254,11 +319,17 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if !rf.isLeader {
+		return -1, -1, false
+	}
+
+	rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
+	index, term := rf.lastLogIndexAndTerm()
+	return index, term, true
+
 }
 
 //
@@ -284,14 +355,12 @@ func (rf *Raft) Kill() {
 //
 
 func (rf *Raft) lastLogIndexAndTerm() (int, int) {
-	lastTerm := 0
-	lastIndex := len(rf.log)
-
-	if lastIndex > 0 {
-		lastTerm = rf.log[lastIndex-1].Term
+	i := len(rf.log) - 1
+	if i >= 0 {
+		return i, rf.log[i].Term
 	}
 
-	return lastIndex, lastTerm
+	return i, -1
 }
 
 func (rf *Raft) requestVotes() {
@@ -310,12 +379,13 @@ func (rf *Raft) requestVotes() {
 		LastLogTerm:  term,
 	}
 
-	for i, p := range rf.peers {
+	for i, peer := range rf.peers {
 		if i == rf.me {
 			continue
 		}
+		peer := peer
 
-		go func(peer *labrpc.ClientEnd) {
+		go func() {
 			reply := &RequestVoteReply{}
 			peer.Call("Raft.RequestVote", args, reply)
 			rf.mu.Lock()
@@ -333,6 +403,10 @@ func (rf *Raft) requestVotes() {
 				return
 			}
 
+			if rf.isLeader {
+				return
+			}
+
 			if reply.VoteGranted {
 				votes++
 				fmt.Printf("up to %d votes\n", votes)
@@ -344,17 +418,50 @@ func (rf *Raft) requestVotes() {
 			if votes > majority {
 				fmt.Println(rf.me, "won the election")
 				rf.isLeader = true
+				index, _ := rf.lastLogIndexAndTerm()
+				rf.matchIndex = []int{}
+				rf.nextIndex = []int{}
+
+				//volatile leader state
+				for i := 0; i < len(rf.peers); i++ {
+					rf.nextIndex = append(rf.nextIndex, index+1)
+					rf.matchIndex = append(rf.matchIndex, -1)
+				}
 			}
 
-		}(p)
+		}()
 	}
+}
+
+func majorityMax(xs []int) int {
+	sort.Ints(xs)
+
+	p := int(len(xs) / 2)
+	return xs[p]
 }
 
 func (rf *Raft) Tick() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		fmt.Println("applying command", i, rf.commitIndex, rf.log)
+		rf.applyCh <- ApplyMsg{
+			Index:   i,
+			Command: rf.log[i].Command,
+		}
+	}
+	rf.lastApplied = rf.commitIndex
+
 	if rf.isLeader {
+		xs := append(rf.matchIndex[:rf.me], rf.matchIndex[rf.me+1:]...)
+		//fmt.Println(xs)
+		N := majorityMax(xs)
+
+		if N > rf.commitIndex && rf.getTerm(N) == rf.currentTerm {
+			fmt.Println("setting commitindex to ", N)
+			rf.commitIndex = N
+		}
 		rf.heartbeat()
 		return
 	}
@@ -377,6 +484,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.timeout = 15 + rand.Intn(15)
 	rf.votedFor = -1
+	rf.applyCh = applyCh
+	rf.commitIndex = -1
+	rf.lastApplied = -1
 
 	go func() {
 		for {
