@@ -142,6 +142,13 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.isLeader = false
+		rf.votedFor = -1
+		//think we know to vote yes here
+	}
+
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
@@ -180,7 +187,7 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) getTerm(index int) int {
-	if index < 0 {
+	if index < 0 || index >= len(rf.log) {
 		return -1
 	}
 
@@ -198,19 +205,24 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+	reply.Success = true
+
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
+	}
 
 	i := args.PrevLogIndex
 	index, _ := rf.lastLogIndexAndTerm()
 
+	if i > index || rf.getTerm(i) != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
 	rf.timeout = 15 + rand.Intn(15)
 	if args.LeaderCommit >= 0 {
 		//fmt.Println("leadercommit > 0 ", args)
-	}
-
-	if i > index || rf.getTerm(i) != args.PrevLogTerm {
-		reply.Success = false
-	} else {
-		reply.Success = true
 	}
 
 	//this was resetting votedfor....
@@ -219,10 +231,9 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.isLeader = false
 		rf.votedFor = -1
 		fmt.Println("term out")
-		return
 	}
 
-	fmt.Println("prevlogindex", i, index)
+	//fmt.Println("prevlogindex", i, index)
 
 	if len(args.Entries) > 0 {
 		fmt.Println("entries:", args.Entries)
@@ -245,11 +256,11 @@ func (rf *Raft) heartbeat() {
 
 			if nextIndex < len(rf.log) && nextIndex >= 0 {
 				entries = rf.log[nextIndex:]
-				fmt.Println("we about to sent these entries", nextIndex, entries)
+				//	fmt.Println("we about to sent these entries", nextIndex, entries)
 
 			}
 
-			fmt.Println("NEXTINDEX", nextIndex)
+			//fmt.Println("NEXTINDEX", nextIndex)
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
@@ -272,7 +283,6 @@ func (rf *Raft) heartbeat() {
 
 				if reply.Success {
 
-					fmt.Println("we sent these entries", nextIndex, entries)
 					rf.nextIndex[i] = index + 1
 					rf.matchIndex[i] = index
 				} else {
@@ -328,8 +338,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
 	index, term := rf.lastLogIndexAndTerm()
-	return index, term, true
 
+	return index + 1, term, true
 }
 
 //
@@ -419,13 +429,13 @@ func (rf *Raft) requestVotes() {
 				fmt.Println(rf.me, "won the election")
 				rf.isLeader = true
 				index, _ := rf.lastLogIndexAndTerm()
-				rf.matchIndex = []int{}
+				rf.matchIndex = make([]int, len(rf.peers))
 				rf.nextIndex = []int{}
 
 				//volatile leader state
 				for i := 0; i < len(rf.peers); i++ {
 					rf.nextIndex = append(rf.nextIndex, index+1)
-					rf.matchIndex = append(rf.matchIndex, -1)
+					//rf.matchIndex = append(rf.matchIndex, -1)
 				}
 			}
 
@@ -444,14 +454,17 @@ func (rf *Raft) Tick() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if rf.lastApplied != rf.commitIndex {
+		//fmt.Println(rf.me, " has 1 to commit", rf.lastApplied, rf.commitIndex)
+	}
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		fmt.Println("applying command", i, rf.commitIndex, rf.log)
+		fmt.Println(rf.me, "is applying command", i, rf.commitIndex, rf.lastApplied, rf.log)
 		rf.applyCh <- ApplyMsg{
-			Index:   i,
+			Index:   i + 1,
 			Command: rf.log[i].Command,
 		}
+		rf.lastApplied += 1
 	}
-	rf.lastApplied = rf.commitIndex
 
 	if rf.isLeader {
 		xs := append(rf.matchIndex[:rf.me], rf.matchIndex[rf.me+1:]...)
@@ -462,6 +475,7 @@ func (rf *Raft) Tick() {
 			fmt.Println("setting commitindex to ", N)
 			rf.commitIndex = N
 		}
+		//fmt.Println("CI:", N, rf.commitIndex)
 		rf.heartbeat()
 		return
 	}
