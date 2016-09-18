@@ -185,8 +185,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term         int
+	Success      bool
+	MaxTermIndex int
 }
 
 func (rf *Raft) getTerm(index int) int {
@@ -204,6 +205,15 @@ func min(a, b int) int {
 	return a
 }
 
+func (rf *Raft) maxTermIndex(term int) int {
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if rf.log[i].Term == term {
+			return i
+		}
+	}
+	return 0
+}
+
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -211,6 +221,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	reply.Success = true
 
 	if args.Term < rf.currentTerm {
+		fmt.Println("leader term is out of date?")
 		reply.Success = false
 		return
 	}
@@ -218,14 +229,11 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	i := args.PrevLogIndex
 	index, _ := rf.lastLogIndexAndTerm()
 
+	//fmt.Println("previndex+term", index, term, args.PrevLogTerm, args.PrevLogIndex, rf.log)
 	if i > index || rf.getTerm(i) != args.PrevLogTerm {
+		reply.MaxTermIndex = rf.maxTermIndex(args.PrevLogTerm)
 		reply.Success = false
 		return
-	}
-
-	rf.timeout = 15 + rand.Intn(15)
-	if args.LeaderCommit >= 0 {
-		//fmt.Println("leadercommit > 0 ", args)
 	}
 
 	//this was resetting votedfor....
@@ -236,14 +244,14 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		fmt.Println("term out")
 	}
 
-	//fmt.Println("prevlogindex", i, index)
-
 	if len(args.Entries) > 0 {
-		fmt.Println("entries:", args.Entries)
+		//fmt.Println("appending entries:", args.Entries)
 		rf.log = append(rf.log[:i+1], args.Entries...)
 	}
 
+	rf.timeout = 15 + rand.Intn(15)
 	rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+
 	return
 }
 
@@ -259,11 +267,8 @@ func (rf *Raft) heartbeat() {
 
 			if nextIndex < len(rf.log) && nextIndex >= 0 {
 				entries = rf.log[nextIndex:]
-				//	fmt.Println("we about to sent these entries", nextIndex, entries)
-
 			}
 
-			//fmt.Println("NEXTINDEX", nextIndex)
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
@@ -274,7 +279,10 @@ func (rf *Raft) heartbeat() {
 			}
 			go func() {
 				reply := &AppendEntriesReply{}
-				peer.Call("Raft.AppendEntries", args, reply)
+				if ok := peer.Call("Raft.AppendEntries", args, reply); !ok {
+					return
+				}
+
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if reply.Term > rf.currentTerm {
@@ -285,11 +293,22 @@ func (rf *Raft) heartbeat() {
 				}
 
 				if reply.Success {
-
 					rf.nextIndex[i] = index + 1
 					rf.matchIndex[i] = index
 				} else {
-					rf.nextIndex[i] = nextIndex - 1
+					/*
+						termStart := 0
+						for j := 0; j < len(rf.log); j++ {
+							if rf.log[j].Term == prevTerm {
+								termStart = j
+								break
+							}
+						}
+					*/
+					rf.matchIndex[i] = reply.MaxTermIndex
+					rf.nextIndex[i] = reply.MaxTermIndex + 1
+
+					//rf.nextIndex[i] = nextIndex - 1
 				}
 			}()
 		}
@@ -339,6 +358,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
+	fmt.Println(command)
 	rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
 	index, term := rf.lastLogIndexAndTerm()
 
@@ -404,7 +424,7 @@ func (rf *Raft) requestVotes() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			if rf.currentTerm > initialTerm {
-				fmt.Println("out of date vote result")
+				//fmt.Println("out of date vote result")
 				return
 			}
 
@@ -447,21 +467,23 @@ func (rf *Raft) requestVotes() {
 }
 
 func majorityMax(xs []int) int {
-	sort.Ints(xs)
+	var ys []int
+	//FUCKME: go needs some immutable functions
+	ys = append(ys, xs...)
+	sort.Ints(ys)
 
-	p := int(len(xs) / 2)
-	return xs[p]
+	p := int(len(ys) / 2)
+	return ys[p]
 }
 
 func (rf *Raft) Tick() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.lastApplied != rf.commitIndex {
-		//fmt.Println(rf.me, " has 1 to commit", rf.lastApplied, rf.commitIndex)
-	}
+	rf.timeout--
+
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		fmt.Println(rf.me, "is applying command", i, rf.commitIndex, rf.lastApplied, rf.log)
+		//fmt.Println(rf.me, "is applying command", i, rf.commitIndex, rf.lastApplied, rf.log)
 		rf.applyCh <- ApplyMsg{
 			Index:   i + 1,
 			Command: rf.log[i].Command,
@@ -470,22 +492,24 @@ func (rf *Raft) Tick() {
 	}
 
 	if rf.isLeader {
-		xs := append(rf.matchIndex[:rf.me], rf.matchIndex[rf.me+1:]...)
-		//fmt.Println(xs)
+		//FUCKME: i didn't mean to mutate this
+		//xs := append(rf.matchIndex[:rf.me], rf.matchIndex[rf.me+1:]...)
+		var xs []int
+		xs = append(xs, rf.matchIndex[:rf.me]...)
+		xs = append(xs, rf.matchIndex[rf.me+1:]...)
+
 		N := majorityMax(xs)
 
 		if N > rf.commitIndex && rf.getTerm(N) == rf.currentTerm {
-			fmt.Println("setting commitindex to ", N)
+			//fmt.Println("setting commitindex to ", N)
 			rf.commitIndex = N
 		}
-		//fmt.Println("CI:", N, rf.commitIndex)
+
+		//FIXME: sending too many heartbeats to pass count test
 		rf.heartbeat()
 		return
 	}
 
-	rf.timeout--
-
-	//fmt.Println(rf.me, rf.timeout)
 	if rf.timeout == 0 {
 		rf.timeout = 15 + rand.Intn(15)
 		rf.requestVotes()
