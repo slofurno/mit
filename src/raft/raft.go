@@ -152,17 +152,20 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
+		fmt.Println("canidate is out of term")
 		reply.VoteGranted = false
 		return
 	}
 
 	if rf.votedFor >= 0 && rf.votedFor != args.CanidateId {
+		fmt.Println("already voted")
 		reply.VoteGranted = false
 		return
 	}
 
 	index, term := rf.lastLogIndexAndTerm()
-	if term > args.LastLogTerm || index > args.LastLogIndex {
+	if term > args.LastLogTerm || (term == args.LastLogTerm && index > args.LastLogIndex) {
+		fmt.Println("voter index/term:", term, index, args.LastLogTerm, args.LastLogIndex)
 		reply.VoteGranted = false
 		return
 	}
